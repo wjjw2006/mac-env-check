@@ -1,0 +1,103 @@
+name: Check Mac course environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            torch: '2.10.0'
+            torchvision: '0.25.0'
+            numpy: numpy
+          - runner: macos-15-intel
+            arch: x86_64
+            torch: '2.2.2'
+            torchvision: '0.17.2'
+            numpy: numpy<2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - name: Install Miniconda and create Python 3.10 environment
+        shell: bash
+        run: |
+          curl -fL "https://repo.anaconda.com/miniconda/Miniconda3-py310_24.11.1-0-MacOSX-${{ matrix.arch }}.sh" -o "$RUNNER_TEMP/miniconda.sh"
+          bash "$RUNNER_TEMP/miniconda.sh" -b -p "$RUNNER_TEMP/course-conda"
+          echo "COURSE_CONDA=$RUNNER_TEMP/course-conda/bin/conda" >> "$GITHUB_ENV"
+          echo "COURSE_ENV=$RUNNER_TEMP/course-env" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/course-conda/bin/conda" create -y -p "$RUNNER_TEMP/course-env" python=3.10
+      - name: Install Spyder and course packages
+        shell: bash
+        run: |
+          "$COURSE_CONDA" install -y -p "$COURSE_ENV" spyder
+          "$COURSE_CONDA" run --no-capture-output -p "$COURSE_ENV" python -m pip install "torch==${{ matrix.torch }}" "torchvision==${{ matrix.torchvision }}" "${{ matrix.numpy }}" matplotlib
+      - name: Check data, computation, plotting and Spyder kernel
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/check_mac.py" <<'PY'
+          from pathlib import Path
+          import json
+          import platform
+          import sys
+          import torch
+          import torchvision
+          import numpy
+          import matplotlib
+          matplotlib.use('Agg')
+          import matplotlib.pyplot as plt
+          from jupyter_client import KernelManager
+
+          output = Path('mac-check-output')
+          output.mkdir(exist_ok=True)
+          data = torchvision.datasets.MNIST(output / 'data', train=False, download=True,
+                                           transform=torchvision.transforms.ToTensor())
+          x, label = data[0]
+          model = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(784, 10))
+          loss = torch.nn.functional.cross_entropy(model(x.unsqueeze(0)), torch.tensor([label]))
+          loss.backward()
+          torch.save(model.state_dict(), output / 'model.pth')
+          model.load_state_dict(torch.load(output / 'model.pth', weights_only=True))
+          plt.imshow(x.squeeze().numpy(), cmap='gray')
+          plt.title(f'MNIST label: {label}')
+          plt.savefig(output / 'plot.png')
+          plt.close()
+
+          manager = KernelManager()
+          manager.kernel_spec.argv = [sys.executable, '-m', 'spyder_kernels.console',
+                                      '-f', '{connection_file}']
+          manager.start_kernel()
+          client = manager.client()
+          client.start_channels()
+          try:
+              client.wait_for_ready(timeout=60)
+              reply = client.execute_interactive(
+                  'import torch, torchvision; print(torch.__version__, torchvision.__version__)',
+                  timeout=60)
+              assert reply['content']['status'] == 'ok', reply['content']
+          finally:
+              client.stop_channels()
+              manager.shutdown_kernel(now=True)
+
+          result = dict(macos=platform.mac_ver()[0], architecture=platform.machine(),
+                        python=platform.python_version(), torch=torch.__version__,
+                        torchvision=torchvision.__version__, numpy=numpy.__version__,
+                        matplotlib=matplotlib.__version__, mnist_test_samples=len(data),
+                        cpu_loss=loss.item(), spyder_kernel='passed')
+          (output / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+          print(json.dumps(result, indent=2))
+          PY
+          "$COURSE_CONDA" run --no-capture-output -p "$COURSE_ENV" python "$RUNNER_TEMP/check_mac.py"
+      - name: Save results
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-environment-${{ matrix.arch }}
+          path: |
+            mac-check-output/result.json
+            mac-check-output/plot.png
